@@ -48,7 +48,7 @@ interface Opts {
   extraCss: string | null;
   htmlClass: string | null;
   outdir: string;
-  excludePattern: string | null;
+  excludePattern: RegExp | null;
   concurrency: number;
   timeout: number;
   json: boolean;
@@ -78,6 +78,22 @@ interface AllStats {
 // ---------------------------------------------------------------------------
 // Argument parsing
 // ---------------------------------------------------------------------------
+// Validate a regex pattern string for safety before compilation.
+// Rejects patterns with constructs known to cause catastrophic backtracking.
+function validateRegexPattern(pattern: string): RegExp {
+  // Reject nested quantifiers that can cause catastrophic backtracking (ReDoS),
+  // e.g. (a+)+, (a*)+, (a+)*, (a{2,})+, etc.
+  const nestedQuantifier = /([+*}])\s*\)\s*[+*?{]/;
+  if (nestedQuantifier.test(pattern)) {
+    throw new Error(
+      `Potentially unsafe regex pattern (nested quantifiers detected): ${pattern}`
+    );
+  }
+
+  // Test that the pattern compiles — throws SyntaxError if invalid
+  return new RegExp(pattern, 'gs');
+}
+
 function parseArgs(): Opts {
   const args = process.argv.slice(2);
   const opts: Opts = {
@@ -105,7 +121,16 @@ function parseArgs(): Opts {
       case '--extra-css': opts.extraCss = args[++i]; break;
       case '--html-class': opts.htmlClass = args[++i]; break;
       case '--outdir': opts.outdir = args[++i]; break;
-      case '--exclude-pattern': opts.excludePattern = args[++i]; break;
+      case '--exclude-pattern': {
+        const rawPattern = args[++i];
+        try {
+          opts.excludePattern = validateRegexPattern(rawPattern);
+        } catch (e: unknown) {
+          console.error(`Error: Invalid --exclude-pattern: ${(e as Error).message}`);
+          process.exit(1);
+        }
+        break;
+      }
       case '--concurrency': opts.concurrency = parseInt(args[++i], 10); break;
       case '--timeout': opts.timeout = parseInt(args[++i], 10); break;
       case '--json': opts.json = true; break;
@@ -229,6 +254,56 @@ function isImageUrl(url: string): boolean {
   return !skip.some((s) => url.includes(s));
 }
 
+/**
+ * Sanitize a string for safe inclusion in log output.
+ * Strips newlines, carriage returns, and control characters to prevent log injection.
+ */
+function sanitizeForLog(str: string): string {
+  return str.replace(/[\x00-\x1F\x7F]/g, '');
+}
+
+/**
+ * Validate that a URL is safe for outbound requests (SSRF protection).
+ * Blocks private/internal network addresses and non-HTTP protocols.
+ * URLs parsed from HTML files could be attacker-controlled, so we must
+ * ensure they only target public internet hosts.
+ */
+function isSafeUrl(parsed: URL): boolean {
+  // Only allow http and https protocols
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return false;
+  }
+
+  const hostname = parsed.hostname.toLowerCase();
+
+  // Block localhost variants
+  if (hostname === 'localhost' || hostname === '[::1]') {
+    return false;
+  }
+
+  // Block private/reserved IPv4 ranges
+  const ipv4Match = hostname.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4Match) {
+    const [, a, b] = ipv4Match.map(Number);
+    if (
+      a === 127 ||          // 127.0.0.0/8  (loopback)
+      a === 10 ||           // 10.0.0.0/8   (private)
+      a === 0 ||            // 0.0.0.0/8    (unspecified)
+      (a === 172 && b >= 16 && b <= 31) || // 172.16.0.0/12 (private)
+      (a === 192 && b === 168) ||          // 192.168.0.0/16 (private)
+      (a === 169 && b === 254)             // 169.254.0.0/16 (link-local)
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// Intentional outbound requests: this function fetches remote images
+// referenced in HTML source files and embeds them as base64 data URIs to
+// produce self-contained HTML snapshots. URLs are validated by isSafeUrl()
+// to block SSRF against private/internal networks.  [CodeQL js/file-access-to-http]
 function fetchAndEncode(url: string, timeout: number, redirectCount = 0): Promise<string> {
   if (imgCache.has(url)) return Promise.resolve(imgCache.get(url)!);
   if (!isImageUrl(url)) {
@@ -240,7 +315,7 @@ function fetchAndEncode(url: string, timeout: number, redirectCount = 0): Promis
   if (redirectCount >= MAX_REDIRECTS) {
     const fallback =
       'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
-    console.warn(`  WARN: Too many redirects (${MAX_REDIRECTS}) <- ${url.slice(0, 70)}...`);
+    console.warn(`  WARN: Too many redirects (${MAX_REDIRECTS}) <- ${sanitizeForLog(url.slice(0, 70))}...`);
     imgCache.set(url, fallback);
     return Promise.resolve(fallback);
   }
@@ -252,7 +327,17 @@ function fetchAndEncode(url: string, timeout: number, redirectCount = 0): Promis
     } catch {
       const fallback =
         'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
-      console.warn(`  WARN: Invalid URL: ${url.slice(0, 70)}...`);
+      console.warn(`  WARN: Invalid URL: ${sanitizeForLog(url.slice(0, 70))}...`);
+      imgCache.set(url, fallback);
+      resolve(fallback);
+      return;
+    }
+
+    // SSRF protection: block requests to private/internal networks
+    if (!isSafeUrl(parsedUrl)) {
+      const fallback =
+        'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+      console.warn(`  WARN: Blocked request to non-public URL: ${sanitizeForLog(url.slice(0, 70))}...`);
       imgCache.set(url, fallback);
       resolve(fallback);
       return;
@@ -288,7 +373,7 @@ function fetchAndEncode(url: string, timeout: number, redirectCount = 0): Promis
           const fallback =
             'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
           console.warn(
-            `  WARN: HTTP ${resp.statusCode} <- ${url.slice(0, 70)}...`,
+            `  WARN: HTTP ${resp.statusCode} <- ${sanitizeForLog(url.slice(0, 70))}...`,
           );
           resp.resume();
           imgCache.set(url, fallback);
@@ -304,14 +389,14 @@ function fetchAndEncode(url: string, timeout: number, redirectCount = 0): Promis
           const result = `data:${ct};base64,${buf.toString('base64')}`;
           imgCache.set(url, result);
           console.log(
-            `  Embedded ${buf.length.toLocaleString()} bytes <- ${url.slice(0, 70)}...`,
+            `  Embedded ${buf.length.toLocaleString()} bytes <- ${sanitizeForLog(url.slice(0, 70))}...`,
           );
           resolve(result);
         });
         resp.on('error', (e: Error) => {
           const fallback =
             'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
-          console.warn(`  WARN: Stream error: ${e.message} <- ${url.slice(0, 70)}...`);
+          console.warn(`  WARN: Stream error: ${sanitizeForLog(e.message)} <- ${sanitizeForLog(url.slice(0, 70))}...`);
           imgCache.set(url, fallback);
           resolve(fallback);
         });
@@ -321,7 +406,7 @@ function fetchAndEncode(url: string, timeout: number, redirectCount = 0): Promis
     req.on('error', (e: Error) => {
       const fallback =
         'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
-      console.warn(`  WARN: ${e.message} <- ${url.slice(0, 70)}...`);
+      console.warn(`  WARN: ${sanitizeForLog(e.message)} <- ${sanitizeForLog(url.slice(0, 70))}...`);
       imgCache.set(url, fallback);
       resolve(fallback);
     });
@@ -330,7 +415,7 @@ function fetchAndEncode(url: string, timeout: number, redirectCount = 0): Promis
       req.destroy();
       const fallback =
         'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
-      console.warn(`  WARN: Timeout after ${timeout}ms <- ${url.slice(0, 70)}...`);
+      console.warn(`  WARN: Timeout after ${timeout}ms <- ${sanitizeForLog(url.slice(0, 70))}...`);
       imgCache.set(url, fallback);
       resolve(fallback);
     });
@@ -907,9 +992,9 @@ async function main(): Promise<void> {
       continue;
     }
 
-    // Apply exclude pattern
+    // Apply exclude pattern (pre-validated during argument parsing)
     if (opts.excludePattern) {
-      body = body.replace(new RegExp(opts.excludePattern, 'gs'), '');
+      body = body.replace(opts.excludePattern, '');
     }
 
     // Extract body class from outer wrapper div

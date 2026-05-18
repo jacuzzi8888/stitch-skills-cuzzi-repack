@@ -240,6 +240,36 @@ function resolveLocalFile(localPath: string, baseDir: string): string | null {
 }
 
 /**
+ * Atomically open, stat, and read a file using a file descriptor.
+ * Eliminates TOCTOU race conditions by performing all operations on the
+ * same fd, ensuring the file cannot change between the size check and read.
+ * Returns null if the file cannot be opened (e.g., deleted between resolve and open).
+ */
+function readFileAtomic(
+  filePath: string,
+  maxSize: number,
+): { size: number; mime: string; b64: string } | { size: number; tooLarge: true } | null {
+  let fd: number;
+  try {
+    fd = fs.openSync(filePath, 'r');
+  } catch {
+    // File was removed or became inaccessible between resolve and open
+    return null;
+  }
+  try {
+    const stat = fs.fstatSync(fd);
+    if (stat.size > maxSize) {
+      return { size: stat.size, tooLarge: true };
+    }
+    const mime = getMime(filePath);
+    const b64 = fs.readFileSync(fd).toString('base64');
+    return { size: stat.size, mime, b64 };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
  * Check if a path is a local (non-remote, non-data) reference.
  */
 function isLocalPath(url: string): boolean {
@@ -282,9 +312,13 @@ function inlineImages(
         return match;
       }
 
-      const fileSize = fs.statSync(resolved).size;
-      if (fileSize > maxSize) {
-        stats.skippedTooLarge.push({ path: localPath, size: fileSize });
+      const result = readFileAtomic(resolved, maxSize);
+      if (!result) {
+        stats.skippedNotFound.push(localPath);
+        return match;
+      }
+      if ('tooLarge' in result) {
+        stats.skippedTooLarge.push({ path: localPath, size: result.size });
         return match;
       }
 
@@ -293,10 +327,8 @@ function inlineImages(
         return match;
       }
 
-      const mime = getMime(resolved);
-      const b64 = fs.readFileSync(resolved).toString('base64');
       stats.srcInlined++;
-      return `${attr}="data:${mime};base64,${b64}"`;
+      return `${attr}="data:${result.mime};base64,${result.b64}"`;
     });
   }
 
@@ -313,9 +345,13 @@ function inlineImages(
       continue;
     }
 
-    const fileSize = fs.statSync(resolved).size;
-    if (fileSize > maxSize) {
-      stats.skippedTooLarge.push({ path: ref.url, size: fileSize });
+    const result = readFileAtomic(resolved, maxSize);
+    if (!result) {
+      stats.skippedNotFound.push(ref.url);
+      continue;
+    }
+    if ('tooLarge' in result) {
+      stats.skippedTooLarge.push({ path: ref.url, size: result.size });
       continue;
     }
 
@@ -324,11 +360,9 @@ function inlineImages(
       continue;
     }
 
-    const mime = getMime(resolved);
-    const b64 = fs.readFileSync(resolved).toString('base64');
     html =
       html.substring(0, ref.start) +
-      `url('data:${mime};base64,${b64}')` +
+      `url('data:${result.mime};base64,${result.b64}')` +
       html.substring(ref.end);
     stats.urlInlined++;
   }
@@ -347,9 +381,13 @@ function inlineImages(
       return match;
     }
 
-    const fileSize = fs.statSync(resolved).size;
-    if (fileSize > maxSize) {
-      stats.skippedTooLarge.push({ path: localPath, size: fileSize });
+    const result = readFileAtomic(resolved, maxSize);
+    if (!result) {
+      stats.skippedNotFound.push(localPath);
+      return match;
+    }
+    if ('tooLarge' in result) {
+      stats.skippedTooLarge.push({ path: localPath, size: result.size });
       return match;
     }
 
@@ -358,10 +396,8 @@ function inlineImages(
       return match;
     }
 
-    const mime = getMime(resolved);
-    const b64 = fs.readFileSync(resolved).toString('base64');
     stats.srcInlined++;
-    return `${attrName}="data:${mime};base64,${b64}"`;
+    return `${attrName}="data:${result.mime};base64,${result.b64}"`;
   });
 
   return { html, stats };
@@ -387,12 +423,21 @@ function main(): void {
   }
 
   for (const file of opts.files) {
-    if (!fs.existsSync(file)) {
+    // Use fd-based read to eliminate TOCTOU race between existence check and read
+    let fd: number;
+    let html: string;
+    try {
+      fd = fs.openSync(file, 'r');
+    } catch {
       console.warn(`⚠️  File not found, skipping: ${file}`);
       continue;
     }
+    try {
+      html = fs.readFileSync(fd, 'utf-8');
+    } finally {
+      fs.closeSync(fd);
+    }
 
-    const html = fs.readFileSync(file, 'utf-8');
     const { html: processed, stats } = inlineImages(
       html,
       opts.baseDir,
